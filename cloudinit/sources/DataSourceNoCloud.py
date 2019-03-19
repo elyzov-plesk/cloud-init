@@ -13,8 +13,10 @@ import os
 
 from cloudinit import log as logging
 from cloudinit.net import eni
+from cloudinit.net.dhcp import EphemeralDHCPv4, NoDHCPLeaseError
 from cloudinit import sources
 from cloudinit import util
+from cloudinit import url_helper
 
 LOG = logging.getLogger(__name__)
 
@@ -29,7 +31,9 @@ class DataSourceNoCloud(sources.DataSource):
         self.seed_dirs = [os.path.join(paths.seed_dir, 'nocloud'),
                           os.path.join(paths.seed_dir, 'nocloud-net')]
         self.seed_dir = None
-        self.supported_seed_starts = ("/", "file://")
+        self.supported_seed_starts = ("/", "file://", "http://", "https://", "ftp://")
+        self.perform_dhcp_setup = True
+        self.request_network_config = False
 
     def __str__(self):
         root = sources.DataSource.__str__(self)
@@ -87,6 +91,10 @@ class DataSourceNoCloud(sources.DataSource):
         if self.ds_cfg.get('seedfrom'):
             found.append("ds_config_seedfrom")
             mydata['meta-data']["seedfrom"] = self.ds_cfg['seedfrom']
+
+        if self.ds_cfg.get('request_network_config'):
+            self.request_network_config = self.ds_cfg['request_network_config']
+
 
         # fields appropriately named can also just come from the datasource
         # config (ie, 'user-data', 'meta-data', 'vendor-data' there)
@@ -157,18 +165,23 @@ class DataSourceNoCloud(sources.DataSource):
 
             # This could throw errors, but the user told us to do it
             # so if errors are raised, let them raise
-            (md_seed, ud) = util.read_seeded(seedfrom, timeout=None)
-            LOG.debug("Using seeded cache data from %s", seedfrom)
+            if self.perform_dhcp_setup:  # Setup networking in init-local stage.
+                try:
+                    with EphemeralDHCPv4(self.fallback_interface):
+                        seeded = self._crawl_metadata(seedfrom, self.request_network_config)
+                except (NoDHCPLeaseError, sources.InvalidMetaDataException) as e:
+                    util.logexc(LOG, str(e))
+                    return False
+            else:
+                seeded = self._crawl_metadata(seedfrom, self.request_network_config)
+                LOG.debug("Using seeded cache data from %s", seedfrom)
 
-            # Values in the command line override those from the seed
-            mydata['meta-data'] = util.mergemanydict([mydata['meta-data'],
-                                                      md_seed])
-            mydata['user-data'] = ud
+            mydata = _merge_new_seed(mydata, seeded)
             found.append(seedfrom)
 
         # Now that we have exhausted any other places merge in the defaults
-        mydata['meta-data'] = util.mergemanydict([mydata['meta-data'],
-                                                  defaults])
+        mydata['meta-data'] = util.mergemanydict([defaults,
+                                                  mydata['meta-data'],])
 
         self.dsmode = self._determine_dsmode(
             [mydata['meta-data'].get('dsmode')])
@@ -185,6 +198,24 @@ class DataSourceNoCloud(sources.DataSource):
         self._network_config = mydata['network-config']
         self._network_eni = mydata['meta-data'].get('network-interfaces')
         return True
+
+    def _crawl_metadata(self, seedfrom, with_network, timeout=5, retries=10, file_retries=0):
+        (md, ud) = util.read_seeded(seedfrom, timeout=None)
+        nc = {}
+        if with_network:
+            if seedfrom.find("%s") >= 0:
+                nc_url = seedfrom % ("network-config",)
+            else:
+                nc_url = "%s%s" % (seedfrom, "network-config")
+            nc_resp = url_helper.read_file_or_url(nc_url, timeout, retries)
+            if nc_resp.ok():
+                nc = util.decode_binary(nc_resp.contents)
+        resp = {
+            "meta-data": md,
+            "user-data": ud,
+            "network-config": nc,
+        }
+        return resp
 
     @property
     def platform_type(self):
@@ -362,7 +393,7 @@ def _merge_new_seed(cur, seeded):
 class DataSourceNoCloudNet(DataSourceNoCloud):
     def __init__(self, sys_cfg, distro, paths):
         DataSourceNoCloud.__init__(self, sys_cfg, distro, paths)
-        self.supported_seed_starts = ("http://", "https://", "ftp://")
+        self.perform_dhcp_setup = False
 
 
 # Used to match classes to dependencies
